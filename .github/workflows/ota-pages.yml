@@ -1,0 +1,129 @@
+name: Build OTA Firmware to GitHub Pages
+
+# Self-hosted OTA channel for this fork. Builds every *_webui env with build.sh,
+# bakes this repo's Pages URL in as the OTA manifest base (every channel, so
+# `ota branch prod|beta` can never fall back to the upstream release server), and
+# publishes <base>/<env>.json + the app .bin that `ota check` / `ota update` read.
+#
+# The firmware fetches the .bin over HTTPS against its CA bundle and does not
+# follow redirects, which is why this serves files from Pages rather than linking
+# GitHub Release assets.
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - webconfig-autostart-lan
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'test/**'
+      - '.gitignore'
+      - 'LICENSE'
+
+concurrency:
+  group: ota-pages
+  cancel-in-progress: false
+
+env:
+  OTA_SITE: https://ha1fdan.github.io/MeshCore
+  OTA_MANIFEST_BASE_URL: https://ha1fdan.github.io/MeshCore/v
+  OTA_MANIFEST_BASE_STABLE_URL: https://ha1fdan.github.io/MeshCore/v
+  # Must differ from stable (verify_ota_channel.py). Nothing is published here, so
+  # `ota branch beta` fails with a 404 instead of reaching another server.
+  OTA_MANIFEST_BASE_DEV_URL: https://ha1fdan.github.io/MeshCore/beta/v
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone Repo
+        uses: actions/checkout@v4
+
+      - name: Cache PlatformIO Toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: pio-toolchains-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            pio-toolchains-${{ runner.os }}-
+
+      - name: Setup Build Environment
+        uses: ./.github/actions/setup-build-environment
+
+      - name: Resolve version and envs
+        id: meta
+        shell: bash
+        run: |
+          # Track upstream's base version so a new MeshCore base is picked up on rebase.
+          BASE=$(sed -nE 's/^  FIRMWARE_VERSION: (v[0-9.]+).*/\1/p' .github/workflows/build-observer-firmwares.yml | head -1)
+          [ -n "$BASE" ] || { echo "could not read FIRMWARE_VERSION"; exit 1; }
+          ENVS=$(grep -rhoE '^\[env:[^]]*_webui\]' platformio.ini variants/*/platformio.ini \
+                 | sed -E 's/^\[env:(.*)\]$/\1/' | sort -u | tr '\n' ' ')
+          [ -n "$ENVS" ] || { echo "no *_webui envs found"; exit 1; }
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "envs=$ENVS" >> "$GITHUB_OUTPUT"
+          echo "Base $BASE, build ${{ github.run_number }}, envs: $ENVS"
+
+      - name: Build Firmwares
+        env:
+          FIRMWARE_VERSION: ${{ steps.meta.outputs.base }}
+          # Monotonic per workflow; the device only updates when this goes up.
+          FIRMWARE_BUILD_NUMBER: ${{ github.run_number }}
+        run: /usr/bin/env bash build.sh build-firmware ${{ steps.meta.outputs.envs }}
+
+      - name: Verify this channel is baked in
+        run: python3 scripts/verify_ota_channel.py --expect prod
+
+      - name: Assemble Pages site
+        env:
+          BASE: ${{ steps.meta.outputs.base }}
+          BUILD: ${{ github.run_number }}
+          ENVS: ${{ steps.meta.outputs.envs }}
+        shell: bash
+        run: |
+          HASH=$(git rev-parse --short HEAD)
+          VERSION="$BASE.$BUILD"
+          mkdir -p _site/v _site/fw
+          touch _site/.nojekyll
+          for ENV in $ENVS; do
+            NAME="$ENV-$VERSION-$HASH"
+            cp "out/$NAME.bin" _site/fw/
+            [ -f "out/$NAME-merged.bin" ] && cp "out/$NAME-merged.bin" _site/fw/
+            PARTSIG=$(cat "out/$ENV.partsig" 2>/dev/null || true)
+            jq -n --arg base "$BASE" --argjson build "$BUILD" --arg version "$VERSION" \
+                  --arg hash "$HASH" --arg file "$OTA_SITE/fw/$NAME.bin" --arg partSig "$PARTSIG" \
+                  '{baseVersion:$base, build:$build, version:$version, hash:$hash, file:$file}
+                   + (if $partSig == "" then {} else {partSig:$partSig} end)' \
+                  > "_site/v/$ENV.json"
+            echo "== v/$ENV.json"; cat "_site/v/$ENV.json"
+          done
+          {
+            echo "<!doctype html><meta charset=utf-8><title>MeshCore OTA</title>"
+            echo "<h1>MeshCore OTA ($VERSION, $HASH)</h1><ul>"
+            for f in _site/v/*.json _site/fw/*.bin; do
+              p=${f#_site/}; echo "<li><a href=\"$p\">$p</a></li>"
+            done
+            echo "</ul>"
+          } > _site/index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
