@@ -9,6 +9,21 @@
 #include <WiFi.h>
 #endif
 #include <helpers/OtaChannel.h>
+#ifdef WEBCONFIG_AUTOSTART_LAN
+#include <esp_ota_ops.h>
+
+#ifndef OTA_VERIFY_PORTAL_UP_MS
+  #define OTA_VERIFY_PORTAL_UP_MS  (60UL * 1000UL)       // portal uptime that proves an image
+#endif
+#ifndef OTA_VERIFY_DEADLINE_MS
+  #define OTA_VERIFY_DEADLINE_MS   (10UL * 60UL * 1000UL) // give up and roll back after this
+#endif
+
+// Arduino marks a fresh OTA image valid in initArduino() unless this returns
+// true. Defer it: MyMesh::loop() confirms the image only once the LAN portal has
+// been reachable, so an update that cannot be managed remotely rolls back.
+extern "C" bool verifyRollbackLater() { return true; }
+#endif
 #if defined(WITH_MQTT_NEIGHBORS)
 #include <helpers/MQTTConnectionPolicy.h>  // kSyncedClockEpoch
 #endif
@@ -1270,6 +1285,17 @@ void MyMesh::begin(FILESYSTEM *fs) {
   }
 #endif
 
+#ifdef WEBCONFIG_AUTOSTART_LAN
+  {
+    esp_ota_img_states_t ota_state;
+    if (esp_ota_get_state_partition(esp_ota_get_running_partition(), &ota_state) == ESP_OK &&
+        ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+      _ota_verify_pending = true;
+      Serial.println("OTA: new image on probation until the LAN portal is up");
+    }
+  }
+#endif
+
   radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
   radio_driver.setTxPower(_prefs.tx_power_dbm);
 
@@ -1839,14 +1865,44 @@ void MyMesh::loop() {
 #ifdef WEBCONFIG_AUTOSTART_LAN
   // Headless installs: serve the LAN portal as soon as the configured network
   // link comes up, so the node can be managed without serial or a LoRa login.
-  // Fires once per boot; a later `stop webconfig` (e.g. before OTA) sticks.
+  // Retries until it starts once per boot; a later `stop webconfig` sticks.
+  uint32_t wc_now = millis();
   if (!_wc_autostart_done && !_webconfig &&
+      (int32_t)(wc_now - _wc_autostart_retry_at) >= 0 &&
       mqttNetworkSetupComplete(_cli.getObserverPrefs()) &&
       activeNetworkLink().isConnected()) {
     char wc_reply[160];
     startWebConfig(false, wc_reply);
     Serial.println(wc_reply);
-    _wc_autostart_done = true;
+    if (_webconfig && _webconfig->isRunning()) {
+      _wc_autostart_done = true;
+    } else {
+      _wc_autostart_retry_at = wc_now + 30000;
+    }
+  }
+
+  // Rollback guard for a freshly OTA'd image: keep it only once the portal has
+  // stayed up for OTA_VERIFY_PORTAL_UP_MS. A crash before then reboots into the
+  // pending image, which the bootloader rejects; a deadline miss rolls back here.
+  if (_ota_verify_pending) {
+    if (_webconfig && _webconfig->isRunning()) {
+      if (_ota_verify_up_since == 0) {
+        _ota_verify_up_since = wc_now ? wc_now : 1;
+      } else if (wc_now - _ota_verify_up_since >= OTA_VERIFY_PORTAL_UP_MS) {
+        esp_ota_mark_app_valid_cancel_rollback();
+        _ota_verify_pending = false;
+        Serial.println("OTA: new image verified, rollback cancelled");
+      }
+    } else {
+      _ota_verify_up_since = 0;
+    }
+    if (_ota_verify_pending && wc_now >= OTA_VERIFY_DEADLINE_MS) {
+      Serial.println("OTA: portal never came up, rolling back to the previous image");
+      esp_ota_mark_app_invalid_rollback_and_reboot();
+      // Only returns when there is no previous image to go back to: keep this one.
+      esp_ota_mark_app_valid_cancel_rollback();
+      _ota_verify_pending = false;
+    }
   }
 #endif
   if (_webconfig) {

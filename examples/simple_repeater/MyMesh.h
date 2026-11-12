@@ -153,7 +153,10 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks
   bool _wc_restart_pending = false;
   uint8_t _wc_slot_restart_mask = 0;
 #ifdef WEBCONFIG_AUTOSTART_LAN
-  bool _wc_autostart_done = false;     // LAN portal auto-start fires once per boot
+  bool _wc_autostart_done = false;     // LAN portal auto-start succeeds once per boot
+  uint32_t _wc_autostart_retry_at = 0; // next attempt after a failed start
+  bool _ota_verify_pending = false;    // booted a fresh OTA image, rollback still armed
+  uint32_t _ota_verify_up_since = 0;   // when the portal came up during verification
 #endif
 #endif
 
