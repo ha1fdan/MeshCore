@@ -79,8 +79,18 @@ set tx 22                       # V3, no PA: 22 dBm + 6.5 dBi MikroTik omni ≈ 
 set mqtt.iata ODE
 set timezone Europe/Copenhagen
 set mqtt1.preset none           # no upload to Let's Mesh
-set mqtt2.preset none
+set mqtt2.preset custom         # own broker: CT 110 meshcore-observer (~/projects/meshcore-observer)
+set mqtt2.server mqtt://192.168.1.236:1883
+set mqtt2.username repeater     # password in /etc/meshcore-observer/repeater-mqtt-password on CT 110
+
+region put #dk                  # Danish traffic is scoped to #dk; without it, scoped floods are dropped
+region put #dk-fyn #dk
+region put #dk-fyn-odense #dk-fyn
+region default #dk              # own adverts scoped like the rest of the network
+region save
 ```
+`region` lists names without the `#` (`dk`), but keys are still derived from `#dk`
+(RegionMap.cpp adds it back). Verified 2026-11-12: every scoped packet heard was `#dk`.
 
 ## Test status
 
