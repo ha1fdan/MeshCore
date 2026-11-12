@@ -152,6 +152,9 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks
   bool _wc_batch_active = false;       // coalesce bridge restarts during a config batch
   bool _wc_restart_pending = false;
   uint8_t _wc_slot_restart_mask = 0;
+#ifdef WEBCONFIG_AUTOSTART_LAN
+  bool _wc_autostart_done = false;     // LAN portal auto-start fires once per boot
+#endif
 #endif
 
 #if defined(WITH_MQTT_NEIGHBORS)

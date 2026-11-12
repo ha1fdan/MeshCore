@@ -1836,6 +1836,19 @@ void MyMesh::loop() {
 #endif
 
 #ifdef WITH_WEBCONFIG
+#ifdef WEBCONFIG_AUTOSTART_LAN
+  // Headless installs: serve the LAN portal as soon as the configured network
+  // link comes up, so the node can be managed without serial or a LoRa login.
+  // Fires once per boot; a later `stop webconfig` (e.g. before OTA) sticks.
+  if (!_wc_autostart_done && !_webconfig &&
+      mqttNetworkSetupComplete(_cli.getObserverPrefs()) &&
+      activeNetworkLink().isConnected()) {
+    char wc_reply[160];
+    startWebConfig(false, wc_reply);
+    Serial.println(wc_reply);
+    _wc_autostart_done = true;
+  }
+#endif
   if (_webconfig) {
     _webconfig->tick(millis());
     if (!_webconfig->isRunning() && !_webconfig->isStopping()) {
