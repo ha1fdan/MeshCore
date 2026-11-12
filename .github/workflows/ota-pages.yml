@@ -74,6 +74,8 @@ jobs:
 
       - name: Build Firmwares
         env:
+          # Pages redirects plain HTTP to HTTPS, so the manifest check must use TLS.
+          PLATFORMIO_BUILD_FLAGS: -DOTA_CHECK_HTTPS=1
           FIRMWARE_VERSION: ${{ steps.meta.outputs.base }}
           # Monotonic per workflow; the device only updates when this goes up.
           FIRMWARE_BUILD_NUMBER: ${{ github.run_number }}

@@ -352,7 +352,15 @@ bool ESP32Board::otaFromManifestImpl(const char* manifest_base, const char* curr
       rootca_crt_bundle_end > rootca_crt_bundle_start) {
     bundle_len = (size_t)(rootca_crt_bundle_end - rootca_crt_bundle_start);
   }
-  if (!dry_run && bundle_len == 0) {
+  // OTA_CHECK_HTTPS: the manifest host forces HTTPS (e.g. GitHub Pages answers
+  // plain HTTP with a 301), so `ota check` and the `ota update` pre-check fetch
+  // the manifest over TLS as well, at the heap cost described below.
+#ifdef OTA_CHECK_HTTPS
+  const bool plain_manifest = false;
+#else
+  const bool plain_manifest = dry_run;
+#endif
+  if (!plain_manifest && bundle_len == 0) {
     strcpy(reply, "ERR: no embedded cert bundle");
     return false;
   }
@@ -364,7 +372,7 @@ bool ESP32Board::otaFromManifestImpl(const char* manifest_base, const char* curr
   HTTPClient http;
   WiFiClientSecure mclient;  // only used for the HTTPS (update) path
 
-  if (dry_run) {
+  if (plain_manifest) {
     // `ota check`: fetch over PLAIN HTTP. With no TLS handshake the fetch costs
     // negligible heap, so the check runs with the MQTT bridge UP even on no-PSRAM
     // — where the cert-bundle TLS verify would otherwise exhaust internal heap
