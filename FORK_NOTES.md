@@ -50,6 +50,53 @@ git fetch upstream && git rebase upstream/observer-firmware && git push --force-
 ```
 Then wait for the "Build OTA Firmware to GitHub Pages" run and do `ota update` in the panel.
 
+## Raw TX (bot identities)
+
+Built into OTA #5 and later (`WEBCONFIG_RAW_TX`). The script is `tools/webui_tx.py`, and its
+docstring has more examples.
+
+One-time setup, in the panel's CLI tab:
+```
+txtoken new      # OK - token <32 hex> (shown once): copy it
+txtoken          # > set / > (not set)
+txtoken off      # disables token auth (panel login still works)
+```
+The token lives in its own SPIFFS file (`/webui_tx_token`). It survives reboots and OTA
+updates, and prefs are untouched. `txtoken new` replaces the old token.
+
+On the PC:
+```
+export MESHCORE_TX_TOKEN=<token>
+mkdir -p ~/.config/meshcore                      # keygen does not create the folder
+tools/webui_tx.py keygen --out ~/.config/meshcore/bot.json --name "Hunderup Bot"   # once; keep out of git
+tools/webui_tx.py advert --key ~/.config/meshcore/bot.json                 # FLOOD (default)
+tools/webui_tx.py advert --key ~/.config/meshcore/bot.json --route ZERO-HOP
+tools/webui_tx.py send --key ~/.config/meshcore/bot.json --to <64-hex pubkey> --text "hej"
+tools/webui_tx.py channel --hashtag "#test" --name "Hunderup Bot" --text "hej"
+read -s MESHCORE_CHANNEL_KEY && export MESHCORE_CHANNEL_KEY   # private channel secret, never on the command line
+tools/webui_tx.py channel --name "Hunderup Bot" --text "hej"
+```
+- `channel --name` is only the display text before the message. Channel posts carry no
+  identity, so they need no key file or advert, and anyone with the key can post as any name.
+- A DM is accepted only after the recipient has heard this identity's advert, so advertise
+  first. Replies and ACKs go to the bot identity, which nothing decrypts, so it is send-only.
+- `advert --type/--lat/--lon/--name` change how the identity appears (chat/repeater/room/sensor,
+  map position). The node rejects adverts with its own public key.
+
+**How it looks on maps.** A node only adds its hash to a packet's path when it *forwards*
+someone else's flood (`Mesh::routeRecvPacket`). A packet it originates leaves with an
+empty path (`sendFlood` sets hop count 0). Bot packets are originated by the loft
+repeater, so they leave with no hops, and the first repeater that re-floods them adds
+its own hash. Maps that read "first hop = neighbor" therefore show *that* node as Hunderup
+Bot's neighbor, not DK_5230_R01_Hunderup. This is expected: the bot looks like a separate
+node standing in the loft, and that neighbor is one the repeater reaches directly (it
+should appear among the repeater's own neighbors too, for the same reason). Adding the
+repeater's hash to injected packets would make the map show the bot behind it, but every
+bot path would then be one hop longer than the real radio route, so it's left as is.
+
+Verified 2026-11-18: a channel post as "Hunderup Bot" arrived on a phone over the air
+(scoped `#dk`, 2-byte path hashes). DMs (`advert` + `send`) have not been tested over the air yet.
+
 ## Don'ts (lockout risks)
 
 - **Never `set bridge.enabled off`.** The bridge task brings WiFi up; off = no WiFi = no panel.
