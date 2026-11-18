@@ -241,6 +241,7 @@ private:
   bool acceptRawTx(AsyncWebServerRequest* req, const WebConfigRawTx::Request& tx);
   void handleAdvertPost(AsyncWebServerRequest* req);
   void handleSendPost(AsyncWebServerRequest* req);
+  void handleChannelPost(AsyncWebServerRequest* req);
   void handleTxResult(AsyncWebServerRequest* req);
 #endif
 

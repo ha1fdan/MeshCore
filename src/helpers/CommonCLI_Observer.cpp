@@ -1239,7 +1239,25 @@ bool CommonCLI::handleObserverCommand(uint32_t sender_timestamp, char* command, 
       // returns true iff so; otherwise it leaves the explanation (up to date /
       // cable flash / error) in reply, which we send without disturbing the
       // bridge or misleading the user with a "Beginning update..." that no-ops.
-      if (_board->otaFromManifest(ota_resolve_base(_prefs->ota_channel), _callbacks->getFirmwareVer(), true, reply)) {
+      bool precheck_ok = _board->otaFromManifest(ota_resolve_base(_prefs->ota_channel), _callbacks->getFirmwareVer(), true, reply);
+#ifdef OTA_UPDATE_ON_PRECHECK_CONNECT_FAIL
+      // Fork: the pre-check runs TLS with the MQTT bridge up, which on this
+      // no-PSRAM board fails to connect intermittently ("manifest HTTP -1"). A
+      // connect failure (negative HTTPClient code) says nothing about whether a
+      // build exists, so go ahead: the deferred update tears the bridge down,
+      // re-fetches the manifest itself, and resumes the bridge on any abort
+      // (including "already up to date"). Real answers (HTTP 404, up to date,
+      // partition change, ...) still stop here.
+      if (!precheck_ok && strncmp(reply, "ERR: manifest HTTP -", 20) == 0) {
+        if (_callbacks->beginDeferredOtaUpdate()) {
+          strcpy(reply, "Pre-check could not connect; updating with MQTT paused. Reboots if a newer build exists, else resumes. Check 'ver' after.");
+        } else {
+          strcpy(reply, "ERR: online OTA not available");
+        }
+        return true;
+      }
+#endif
+      if (precheck_ok) {
         // reply now holds "update available: <cur> -> <target> (N behind|new base)",
         // where <target> is "vX.Y.Z.B (hash)". Pull <target> out for a friendlier
         // start message. The "-> " ... trailing " (" framing is produced by

@@ -7,13 +7,19 @@ finished packet payloads over:
 
     POST /api/advert   {"advert": hex, "route": "FLOOD" | "ZERO-HOP"}
     POST /api/send     {"payload": hex, "path": hex, "path_hash_size": n}
+    POST /api/channel  {"payload": hex}
     GET  /api/tx/result?id=N
 
 Examples:
-    webui_tx.py keygen --out bot.json --name "Hjallese Bot"
+    webui_tx.py keygen --out bot.json --name "Hunderup Bot"
     webui_tx.py advert --key bot.json                      # FLOOD (default)
     webui_tx.py advert --key bot.json --route ZERO-HOP
     webui_tx.py send --key bot.json --to <64-hex pubkey> --text "hej"
+    webui_tx.py channel --hashtag "#test" --name "Hunderup Bot" --text "hej"
+    MESHCORE_CHANNEL_KEY=<hex> webui_tx.py channel --name "Hunderup Bot" --text "hej"
+
+Channel messages need no identity: the sender name is just text inside the
+encrypted message, and anyone with the channel key can post under any name.
 
 Auth: run `txtoken new` once in the panel's CLI tab and pass the printed token
 with --token or MESHCORE_TX_TOKEN. Without a token the script logs in with the
@@ -233,6 +239,39 @@ def build_txt_msg(prv, pub, dest_pub, text, attempt=0, timestamp=None):
     return payload
 
 
+def channel_secret(key=None, hashtag=None):
+    """Return (secret, hash_byte) the way the firmware derives them.
+    Private channels: the 16- or 32-byte key from the app's share screen (hex,
+    or base64). Hashtag channels: sha256("#name")[:16]."""
+    if hashtag:
+        if not hashtag.startswith("#"):
+            hashtag = "#" + hashtag
+        raw = hashlib.sha256(hashtag.encode()).digest()[:16]
+    else:
+        k = key.strip()
+        if len(k) in (32, 64) and all(c in "0123456789abcdefABCDEF" for c in k):
+            raw = bytes.fromhex(k)
+        else:
+            import base64
+            raw = base64.b64decode(k, validate=True)
+    if len(raw) not in (16, 32):
+        raise ValueError("channel key must be 16 or 32 bytes")
+    # The firmware hashes only the real key length, but keeps a 32-byte
+    # zero-padded buffer for the HMAC key.
+    return raw.ljust(32, b"\0"), hashlib.sha256(raw).digest()[0]
+
+
+def build_grp_txt(secret, hash_byte, sender_name, text, timestamp=None):
+    body = f"{sender_name}: {text}".encode("utf-8")
+    if len(body) > MAX_TEXT_LEN:
+        raise ValueError(f"name + text is {len(body)} bytes, max {MAX_TEXT_LEN}")
+    ts = int(time.time()) if timestamp is None else timestamp
+    plain = struct.pack("<I", ts) + b"\0" + body
+    payload = bytes([hash_byte]) + encrypt_then_mac(secret, plain)
+    assert len(payload) <= MAX_PACKET_PAYLOAD
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # Key files
 # ---------------------------------------------------------------------------
@@ -374,6 +413,18 @@ def cmd_send(args):
     finish("/api/send", body, args)
 
 
+def cmd_channel(args):
+    key = args.channel_key or os.environ.get("MESHCORE_CHANNEL_KEY")
+    if bool(key) == bool(args.hashtag):
+        sys.exit("give exactly one of --hashtag or --channel-key / MESHCORE_CHANNEL_KEY")
+    try:
+        secret, h = channel_secret(key=key, hashtag=args.hashtag)
+        payload = build_grp_txt(secret, h, args.name, args.text)
+    except ValueError as e:
+        sys.exit(str(e))
+    finish("/api/channel", {"payload": payload.hex()}, args)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default=os.environ.get("MESHCORE_HOST", "192.168.1.175"))
@@ -414,6 +465,13 @@ def main():
     p.add_argument("--path-hash-size", type=int, default=1, choices=[1, 2, 3])
     p.add_argument("--attempt", type=int, default=0, help=argparse.SUPPRESS)
     p.set_defaults(fn=cmd_send)
+
+    p = sub.add_parser("channel", help="post to a group channel (no identity needed)")
+    p.add_argument("--hashtag", help='hashtag channel, e.g. "#test" (key derived from the name)')
+    p.add_argument("--channel-key", help="private channel secret, hex or base64 (or MESHCORE_CHANNEL_KEY)")
+    p.add_argument("--name", required=True, help="sender name shown before the text")
+    p.add_argument("--text", required=True)
+    p.set_defaults(fn=cmd_channel)
 
     args = ap.parse_args()
     args.fn(args)

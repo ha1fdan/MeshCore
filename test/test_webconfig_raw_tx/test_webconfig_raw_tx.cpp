@@ -73,6 +73,18 @@ TEST(RawTxTxt, LengthAndAlignment) {
   EXPECT_NE(checkTxtPayload(kTxtHeaderLen + 192), nullptr);   // over MAX_PACKET_PAYLOAD
 }
 
+TEST(RawTxGrp, LengthAndAlignment) {
+  EXPECT_NE(checkGrpPayload(kGrpHeaderLen), nullptr);
+  EXPECT_EQ(checkGrpPayload(kGrpHeaderLen + 16), nullptr);   // 19: smallest real message
+  EXPECT_NE(checkGrpPayload(kGrpHeaderLen + 15), nullptr);
+  EXPECT_NE(checkGrpPayload(kGrpHeaderLen + 17), nullptr);
+  EXPECT_EQ(checkGrpPayload(kGrpHeaderLen + 176), nullptr);  // 179
+  EXPECT_NE(checkGrpPayload(kGrpHeaderLen + 192), nullptr);  // > MAX_PACKET_PAYLOAD
+  // A DM-shaped payload (4-byte header) is not a valid channel payload, and vice versa.
+  EXPECT_NE(checkGrpPayload(kTxtHeaderLen + 16), nullptr);
+  EXPECT_NE(checkTxtPayload(kGrpHeaderLen + 16), nullptr);
+}
+
 TEST(RawTxPath, EncodesSizeAndCount) {
   uint8_t enc = 0;
   ASSERT_EQ(encodePath(3, 1, &enc), nullptr); EXPECT_EQ(enc, 3);

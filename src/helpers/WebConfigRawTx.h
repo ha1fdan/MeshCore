@@ -4,6 +4,7 @@
 //
 //   POST /api/advert  {"advert":"<hex>", "route":"FLOOD"|"ZERO-HOP"}
 //   POST /api/send    {"payload":"<hex>", "path":"<hex>", "path_hash_size":1..3}
+//   POST /api/channel {"payload":"<hex>"}   (GRP_TXT, always flooded)
 //   GET  /api/tx/result?id=N
 //
 // The client (tools/webui_tx.py) holds the private keys and does all signing
@@ -25,6 +26,7 @@ enum class Kind : uint8_t {
   AdvertZeroHop,
   TxtFlood,
   TxtDirect,
+  GrpFlood,
 };
 
 struct Request {
@@ -99,6 +101,17 @@ inline const char* checkAdvertPayload(const uint8_t* p, size_t len, const uint8_
   if (len < kAdvertMinLen) return "advert too short";
   if (len > kAdvertMaxLen) return "advert too long";
   if (own_pub_key && memcmp(p, own_pub_key, PUB_KEY_SIZE) == 0) return "that is this node's own key";
+  return NULL;
+}
+
+// GRP_TXT payload: channel_hash(1) + MAC(2) + ciphertext(n*16).
+static const size_t kGrpHeaderLen = PATH_HASH_SIZE + CIPHER_MAC_SIZE;
+static const size_t kGrpMinLen = kGrpHeaderLen + CIPHER_BLOCK_SIZE;
+
+inline const char* checkGrpPayload(size_t len) {
+  if (len < kGrpMinLen) return "payload too short";
+  if (len > MAX_PACKET_PAYLOAD) return "payload too long";
+  if ((len - kGrpHeaderLen) % CIPHER_BLOCK_SIZE != 0) return "ciphertext not block aligned";
   return NULL;
 }
 

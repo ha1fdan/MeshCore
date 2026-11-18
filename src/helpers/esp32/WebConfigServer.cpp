@@ -737,6 +737,8 @@ void WebConfigServer::registerRoutes() {
               NULL, collectBody);
   _server->on("/api/send", HTTP_POST, [](AsyncWebServerRequest* r) { dispatchRequest(r, &WebConfigServer::handleSendPost); },
               NULL, collectBody);
+  _server->on("/api/channel", HTTP_POST, [](AsyncWebServerRequest* r) { dispatchRequest(r, &WebConfigServer::handleChannelPost); },
+              NULL, collectBody);
 #endif
   _server->onNotFound([](AsyncWebServerRequest* r) { dispatchRequest(r, &WebConfigServer::handleNotFound); });
 }
@@ -1754,6 +1756,27 @@ void WebConfigServer::handleSendPost(AsyncWebServerRequest* req) {
   } else {
     tx.kind = WebConfigRawTx::Kind::TxtFlood;
   }
+  acceptRawTx(req, tx);
+}
+
+void WebConfigServer::handleChannelPost(AsyncWebServerRequest* req) {
+  if (_mode != MODE_LAN) { req->send(403, "application/json", "{\"error\":\"LAN mode only\"}"); return; }
+  if (!checkTxAuth(req)) { req->send(401, "application/json", "{\"error\":\"auth\"}"); return; }
+  const char* body = (const char*)req->_tempObject;
+  if (!body) { req->send(413, "application/json", "{\"error\":\"body missing or too large\"}"); return; }
+  DynamicJsonDocument doc(768);
+  if (deserializeJson(doc, body) != DeserializationError::Ok) { sendTxError(req, "bad json"); return; }
+
+  WebConfigRawTx::Request tx;
+  size_t len = 0;
+  if (!WebConfigRawTx::parseHex(doc["payload"] | "", tx.payload, sizeof(tx.payload), &len)) {
+    sendTxError(req, "payload must be hex");
+    return;
+  }
+  const char* err = WebConfigRawTx::checkGrpPayload(len);
+  if (err) { sendTxError(req, err); return; }
+  tx.payload_len = (uint8_t)len;
+  tx.kind = WebConfigRawTx::Kind::GrpFlood;
   acceptRawTx(req, tx);
 }
 

@@ -1681,13 +1681,17 @@ bool MyMesh::injectRawPacket(const WebConfigRawTx::Request& tx, char* msg, size_
     snprintf(msg, msg_size, "packet pool empty, retry");
     return false;
   }
-  pkt->header = ((is_advert ? PAYLOAD_TYPE_ADVERT : PAYLOAD_TYPE_TXT_MSG) << PH_TYPE_SHIFT);
+  uint8_t type = PAYLOAD_TYPE_TXT_MSG;
+  if (is_advert) type = PAYLOAD_TYPE_ADVERT;
+  else if (tx.kind == Kind::GrpFlood) type = PAYLOAD_TYPE_GRP_TXT;
+  pkt->header = (type << PH_TYPE_SHIFT);
   memcpy(pkt->payload, tx.payload, tx.payload_len);
   pkt->payload_len = tx.payload_len;
 
   switch (tx.kind) {
     case Kind::AdvertFlood:
     case Kind::TxtFlood:
+    case Kind::GrpFlood:
       sendFloodScoped(default_scope, pkt, 0, _prefs.path_hash_mode + 1);
       snprintf(msg, msg_size, "queued flood%s", default_scope.isNull() ? " (unscoped)" : " (scoped)");
       break;

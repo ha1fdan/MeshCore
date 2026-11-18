@@ -3,7 +3,7 @@
 Fork of [agessaman/MeshCore](https://github.com/agessaman/MeshCore) (`observer-firmware`
 branch, the MQTT Observer firmware). Work branch and fork default: `webconfig-autostart-lan`.
 
-Built for `DK_5230_R01_Hjallese`, a Heltec V3 in the loft at 192.168.1.175 on a smart
+Built for `DK_5230_R01_Hunderup`, a Heltec V3 in the loft at 192.168.1.175 on a smart
 plug, with no USB access and no companion node. Every change here exists so it can be
 managed and updated without the ladder.
 
@@ -15,8 +15,9 @@ managed and updated without the ladder.
 | OTA rollback guard | `MyMesh.cpp` (`verifyRollbackLater`, loop) | Arduino marks a new OTA image valid at boot. Instead it stays on probation until the panel has been up 60 s. A crash before that, or 10 min without the panel, boots the previous image. |
 | `OTA_CHECK_HTTPS` | `src/helpers/ESP32Board.cpp` | Upstream fetches the manifest over plain HTTP for `ota check` and the `ota update` pre-check. GitHub Pages redirects HTTP to HTTPS (301), so OTA never worked. With this flag the check uses the CA-verified TLS path. |
 | Env `Heltec_v3_repeater_observer_mqtt_webui` | `variants/heltec_v3/platformio.ini` | Stock V3 observer env + `WEBCONFIG_AUTOSTART_LAN`. Stock envs are unchanged. |
+| `OTA_UPDATE_ON_PRECHECK_CONNECT_FAIL` | `src/helpers/CommonCLI_Observer.cpp` | `ota update`'s pre-check fetches the manifest over TLS with MQTT up and fails intermittently on this no-PSRAM board (`manifest HTTP -1`). On a connect failure (negative code) it now proceeds with the deferred update, which pauses MQTT, re-checks the manifest itself, and resumes MQTT on any abort (up to date, partition change, download error). |
 | `.github/workflows/ota-pages.yml` | | Builds every `*_webui` env and publishes the OTA channel to GitHub Pages. |
-| `WEBCONFIG_RAW_TX` | `src/helpers/WebConfigRawTx.h`, `WebConfigServer.cpp`, `MyMesh.cpp` (`injectRawPacket`), `tools/webui_tx.py` | `POST /api/advert` + `POST /api/send` (+ `GET /api/tx/result?id=N`): transmit adverts / DMs for *other* identities. Keys and crypto stay on the PC (`tools/webui_tx.py`); the node checks shape, verifies advert signatures, and sends through its normal paths (floods use `default_scope` = `#dk`). LAN mode + panel login only, 1 packet per 3 s. Send-only: replies/ACKs to those identities are just forwarded. |
+| `WEBCONFIG_RAW_TX` | `src/helpers/WebConfigRawTx.h`, `WebConfigServer.cpp`, `MyMesh.cpp` (`injectRawPacket`), `tools/webui_tx.py` | `POST /api/advert` + `POST /api/send` + `POST /api/channel` (+ `GET /api/tx/result?id=N`): transmit adverts / DMs for *other* identities, and channel (GRP_TXT) posts. Keys and crypto stay on the PC (`tools/webui_tx.py`); the node checks shape, verifies advert signatures, and sends through its normal paths (floods use `default_scope` = `#dk`). Auth: panel login or `X-Api-Token` (`txtoken new|off`). LAN mode only, 1 packet per 3 s. Send-only: replies/ACKs to those identities are just forwarded. |
 
 ## OTA channel
 
@@ -74,7 +75,7 @@ Board check: the V3 has 8 MB flash. V4 images (16 MB) boot-loop on it with
 ## Node config (for reference)
 
 ```
-set name DK_5230_R01_Hjallese
+set name DK_5230_R01_Hunderup
 set radio 869.618,62.5,8,8      # EU/UK Narrow, what all of Fyn runs
 set tx 22                       # V3, no PA: 22 dBm + 6.5 dBi MikroTik omni ≈ 430 mW ERP (limit 500)
 set mqtt.iata ODE
