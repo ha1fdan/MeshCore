@@ -551,6 +551,11 @@ public:
     return false;
   }
   void buildStatsJson(char* buf, size_t buf_size) override;
+#ifdef WEBCONFIG_RAW_TX
+  bool injectRawPacket(const WebConfigRawTx::Request& tx, char* msg, size_t msg_size) override;
+  void loadRawTxToken();
+  bool handleRawTxTokenCommand(const char* command, char* reply);
+#endif
 #endif
 
   // To check if there is pending work

@@ -528,6 +528,9 @@ void WebConfigServer::tick(uint32_t now) {
   if (_dns) _dns->processNextRequest();
 
   if (_batch_state == BATCH_PENDING) drainBatch(now);
+#ifdef WEBCONFIG_RAW_TX
+  if (_tx_state == TX_PENDING) drainRawTx();
+#endif
 
   if (WebConfigBatch::rebootDue(_reboot_at, now)) {
     Serial.printf("WC: rebooting now (%s)\n", _batch_reboot_armed ? "confirmed" : "fallback");
@@ -728,6 +731,13 @@ void WebConfigServer::registerRoutes() {
   _server->on("/api/scan", HTTP_GET, [](AsyncWebServerRequest* r) { dispatchRequest(r, &WebConfigServer::handleScan); });
   _server->on("/api/reboot", HTTP_POST, [](AsyncWebServerRequest* r) { dispatchRequest(r, &WebConfigServer::handleReboot); });
   _server->on("/api/portal/exit", HTTP_POST, [](AsyncWebServerRequest* r) { dispatchRequest(r, &WebConfigServer::handlePortalExit); });
+#ifdef WEBCONFIG_RAW_TX
+  _server->on("/api/tx/result", HTTP_GET, [](AsyncWebServerRequest* r) { dispatchRequest(r, &WebConfigServer::handleTxResult); });
+  _server->on("/api/advert", HTTP_POST, [](AsyncWebServerRequest* r) { dispatchRequest(r, &WebConfigServer::handleAdvertPost); },
+              NULL, collectBody);
+  _server->on("/api/send", HTTP_POST, [](AsyncWebServerRequest* r) { dispatchRequest(r, &WebConfigServer::handleSendPost); },
+              NULL, collectBody);
+#endif
   _server->onNotFound([](AsyncWebServerRequest* r) { dispatchRequest(r, &WebConfigServer::handleNotFound); });
 }
 
@@ -1578,6 +1588,203 @@ void WebConfigServer::handlePortalExit(AsyncWebServerRequest* req) {
            WiFi.softAPIP().toString().c_str());
   req->send(200, "application/json", body);
 }
+
+#ifdef WEBCONFIG_RAW_TX
+// ---------------------------------------------------------------------------
+// Raw TX (/api/advert, /api/send). Handlers only check shape and park the bytes;
+// tick() hands them to the mesh on the loop task. LAN mode + login only: the
+// open setup AP must never be able to key the radio.
+// ---------------------------------------------------------------------------
+
+static portMUX_TYPE s_tx_token_mux = portMUX_INITIALIZER_UNLOCKED;
+static char s_tx_token[WebConfigRawTx::kTokenHexLen + 1] = {0};
+
+void WebConfigServer::setRawTxToken(const char* token) {
+  portENTER_CRITICAL(&s_tx_token_mux);
+  if (token && WebConfigRawTx::isValidToken(token)) {
+    memcpy(s_tx_token, token, sizeof(s_tx_token));
+  } else {
+    memset(s_tx_token, 0, sizeof(s_tx_token));
+  }
+  portEXIT_CRITICAL(&s_tx_token_mux);
+}
+
+bool WebConfigServer::hasRawTxToken() {
+  portENTER_CRITICAL(&s_tx_token_mux);
+  bool set = s_tx_token[0] != 0;
+  portEXIT_CRITICAL(&s_tx_token_mux);
+  return set;
+}
+
+// X-Api-Token if the request carries one (never falls back to the cookie when a
+// token was offered, so a wrong token is always a 401), else the panel session.
+bool WebConfigServer::checkTxAuth(AsyncWebServerRequest* req) {
+  if (!req->hasHeader("X-Api-Token")) return checkAuth(req);
+  _last_activity = millis();
+  const String& got = req->getHeader("X-Api-Token")->value();
+  char expected[sizeof(s_tx_token)];
+  portENTER_CRITICAL(&s_tx_token_mux);
+  memcpy(expected, s_tx_token, sizeof(expected));
+  portEXIT_CRITICAL(&s_tx_token_mux);
+  bool ok = WebConfigRawTx::tokenEquals(got.c_str(), expected);
+  memset(expected, 0, sizeof(expected));
+  return ok;
+}
+
+void WebConfigServer::drainRawTx() {
+  WebConfigRawTx::Request tx;
+  {
+    WCLock lock(_mux);
+    if (_tx_state != TX_PENDING) return;
+    tx = _tx_req;
+  }
+  char msg[sizeof(_tx_msg)];
+  msg[0] = 0;
+  bool ok = _cb->injectRawPacket(tx, msg, sizeof(msg));
+  Serial.printf("WC: raw tx #%lu kind=%d len=%d -> %s %s\n", (unsigned long)_tx_id,
+                (int)tx.kind, (int)tx.payload_len, ok ? "OK" : "ERR", msg);
+  WCLock lock(_mux);
+  _tx_ok = ok;
+  strncpy(_tx_msg, msg, sizeof(_tx_msg) - 1);
+  _tx_msg[sizeof(_tx_msg) - 1] = 0;
+  _tx_state = TX_DONE;
+}
+
+bool WebConfigServer::acceptRawTx(AsyncWebServerRequest* req, const WebConfigRawTx::Request& tx) {
+  uint32_t now = millis();
+  uint32_t id = 0;
+  enum { ACCEPTED, BUSY, RATE } verdict = ACCEPTED;
+  {
+    // Decide and park under the lock; reply after releasing it.
+    WCLock lock(_mux);
+    if (_tx_state == TX_PENDING) {
+      verdict = BUSY;
+    } else if (!WebConfigRawTx::rateOk(_tx_last_accept, now, WEBCONFIG_RAW_TX_MIN_INTERVAL_MS)) {
+      verdict = RATE;
+    } else {
+      _tx_req = tx;
+      id = ++_tx_id;
+      if (id == 0) id = ++_tx_id;
+      _tx_last_accept = now ? now : 1;
+      _tx_ok = false;
+      _tx_msg[0] = 0;
+      _tx_state = TX_PENDING;
+    }
+  }
+  if (verdict == BUSY) {
+    req->send(429, "application/json", "{\"error\":\"busy, previous packet not sent yet\"}");
+    return false;
+  }
+  if (verdict == RATE) {
+    char err[80];
+    snprintf(err, sizeof(err), "{\"error\":\"rate limited, min %lu ms between packets\"}",
+             (unsigned long)WEBCONFIG_RAW_TX_MIN_INTERVAL_MS);
+    req->send(429, "application/json", err);
+    return false;
+  }
+  char body[48];
+  snprintf(body, sizeof(body), "{\"ok\":true,\"id\":%lu}", (unsigned long)id);
+  req->send(202, "application/json", body);
+  return true;
+}
+
+static void sendTxError(AsyncWebServerRequest* req, const char* reason) {
+  DynamicJsonDocument doc(128);
+  doc["error"] = reason;
+  AsyncResponseStream* res = req->beginResponseStream("application/json");
+  res->setCode(400);
+  serializeJson(doc, *res);
+  req->send(res);
+}
+
+void WebConfigServer::handleAdvertPost(AsyncWebServerRequest* req) {
+  if (_mode != MODE_LAN) { req->send(403, "application/json", "{\"error\":\"LAN mode only\"}"); return; }
+  if (!checkTxAuth(req)) { req->send(401, "application/json", "{\"error\":\"auth\"}"); return; }
+  const char* body = (const char*)req->_tempObject;
+  if (!body) { req->send(413, "application/json", "{\"error\":\"body missing or too large\"}"); return; }
+  DynamicJsonDocument doc(768);
+  if (deserializeJson(doc, body) != DeserializationError::Ok) { sendTxError(req, "bad json"); return; }
+
+  bool zero_hop = false;
+  if (!WebConfigRawTx::parseAdvertRoute(doc["route"] | "", &zero_hop)) {
+    sendTxError(req, "route must be FLOOD or ZERO-HOP");
+    return;
+  }
+  WebConfigRawTx::Request tx;
+  size_t len = 0;
+  if (!WebConfigRawTx::parseHex(doc["advert"] | "", tx.payload, sizeof(tx.payload), &len)) {
+    sendTxError(req, "advert must be hex");
+    return;
+  }
+  const char* err = WebConfigRawTx::checkAdvertPayload(tx.payload, len, _pub_key);
+  if (err) { sendTxError(req, err); return; }
+  tx.payload_len = (uint8_t)len;
+  tx.kind = zero_hop ? WebConfigRawTx::Kind::AdvertZeroHop : WebConfigRawTx::Kind::AdvertFlood;
+  acceptRawTx(req, tx);
+}
+
+void WebConfigServer::handleSendPost(AsyncWebServerRequest* req) {
+  if (_mode != MODE_LAN) { req->send(403, "application/json", "{\"error\":\"LAN mode only\"}"); return; }
+  if (!checkTxAuth(req)) { req->send(401, "application/json", "{\"error\":\"auth\"}"); return; }
+  const char* body = (const char*)req->_tempObject;
+  if (!body) { req->send(413, "application/json", "{\"error\":\"body missing or too large\"}"); return; }
+  DynamicJsonDocument doc(1024);
+  if (deserializeJson(doc, body) != DeserializationError::Ok) { sendTxError(req, "bad json"); return; }
+
+  WebConfigRawTx::Request tx;
+  size_t len = 0;
+  if (!WebConfigRawTx::parseHex(doc["payload"] | "", tx.payload, sizeof(tx.payload), &len)) {
+    sendTxError(req, "payload must be hex");
+    return;
+  }
+  const char* err = WebConfigRawTx::checkTxtPayload(len);
+  if (err) { sendTxError(req, err); return; }
+  tx.payload_len = (uint8_t)len;
+
+  const char* path_hex = doc["path"] | "";
+  if (*path_hex) {
+    size_t path_bytes = 0;
+    if (!WebConfigRawTx::parseHex(path_hex, tx.path, sizeof(tx.path), &path_bytes)) {
+      sendTxError(req, "path must be hex, max 64 bytes");
+      return;
+    }
+    err = WebConfigRawTx::encodePath(path_bytes, doc["path_hash_size"] | 1, &tx.path_len);
+    if (err) { sendTxError(req, err); return; }
+    tx.kind = WebConfigRawTx::Kind::TxtDirect;
+  } else {
+    tx.kind = WebConfigRawTx::Kind::TxtFlood;
+  }
+  acceptRawTx(req, tx);
+}
+
+void WebConfigServer::handleTxResult(AsyncWebServerRequest* req) {
+  if (_mode != MODE_LAN) { req->send(403, "application/json", "{\"error\":\"LAN mode only\"}"); return; }
+  if (!checkTxAuth(req)) { req->send(401, "application/json", "{\"error\":\"auth\"}"); return; }
+  if (!req->hasParam("id")) { sendTxError(req, "missing id"); return; }
+  uint32_t want = (uint32_t)strtoul(req->getParam("id")->value().c_str(), NULL, 10);
+
+  DynamicJsonDocument doc(192);
+  char msg[sizeof(_tx_msg)];   // copied under the lock; the doc may keep a pointer
+  {
+    WCLock lock(_mux);
+    if (want == 0 || want != _tx_id || _tx_state == TX_IDLE) {
+      doc["id"] = want;
+      doc["state"] = "unknown";
+    } else {
+      doc["id"] = _tx_id;
+      doc["state"] = (_tx_state == TX_PENDING) ? "pending" : "done";
+      if (_tx_state == TX_DONE) {
+        doc["ok"] = _tx_ok;
+        memcpy(msg, _tx_msg, sizeof(msg));
+        doc["msg"] = (const char*)msg;
+      }
+    }
+  }
+  AsyncResponseStream* res = req->beginResponseStream("application/json");
+  serializeJson(doc, *res);
+  req->send(res);
+}
+#endif  // WEBCONFIG_RAW_TX
 
 void WebConfigServer::handleNotFound(AsyncWebServerRequest* req) {
   // Captive-portal probes (/generate_204, /hotspot-detect.html, /ncsi.txt,

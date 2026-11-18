@@ -31,6 +31,9 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <helpers/WebConfigBatch.h>
+#ifdef WEBCONFIG_RAW_TX
+#include <helpers/WebConfigRawTx.h>
+#endif
 
 class AsyncWebServer;
 class AsyncWebServerRequest;
@@ -65,6 +68,14 @@ public:
     virtual void buildStatsJson(char* buf, size_t buf_size) = 0;
     // Teardown finished (session + DNS freed, WiFi mode restored).
     virtual void onWebConfigStopped() {}
+#ifdef WEBCONFIG_RAW_TX
+    // Transmit a client-built packet (/api/advert, /api/send). Called from
+    // tick() (loop task) so it may touch the radio. Writes a short outcome to msg.
+    virtual bool injectRawPacket(const WebConfigRawTx::Request& tx, char* msg, size_t msg_size) {
+      snprintf(msg, msg_size, "raw tx not supported");
+      return false;
+    }
+#endif
   };
 
   WebConfigServer(NodePrefs* prefs, MQTTPrefs* obs, Callbacks* callbacks,
@@ -82,6 +93,13 @@ public:
   // about to reboot — ground truth for the user even if the browser lost its
   // connection before the confirmation arrived. Loop task only.
   static bool isRebootPending();
+
+#ifdef WEBCONFIG_RAW_TX
+  // Token accepted by the TX endpoints in an X-Api-Token header (instead of a
+  // panel login). NULL/empty disables token auth. Any task; copies the string.
+  static void setRawTxToken(const char* token);
+  static bool hasRawTxToken();
+#endif
 
   bool startSetupMode(char reply[]);   // open SoftAP + DNS captive portal
   bool startLanMode(bool initial_setup, char reply[]);  // bind to the selected network
@@ -206,6 +224,25 @@ private:
   // the routes are serving before the first tick, so the two really do race.
   uint8_t _board_cmds = 0;
   bool _board_cmds_probed = false;
+
+#ifdef WEBCONFIG_RAW_TX
+  // Single-slot raw-TX hand-off: filled by the async handler under _mux,
+  // transmitted by tick(). Results are kept until the next request so the
+  // client can poll /api/tx/result?id=N.
+  enum TxState : uint8_t { TX_IDLE = 0, TX_PENDING, TX_DONE };
+  volatile TxState _tx_state = TX_IDLE;
+  uint32_t _tx_id = 0;
+  uint32_t _tx_last_accept = 0;   // millis() of last accepted request, 0 = never
+  bool _tx_ok = false;
+  char _tx_msg[64] = {0};
+  WebConfigRawTx::Request _tx_req;
+  void drainRawTx();
+  bool checkTxAuth(AsyncWebServerRequest* req);
+  bool acceptRawTx(AsyncWebServerRequest* req, const WebConfigRawTx::Request& tx);
+  void handleAdvertPost(AsyncWebServerRequest* req);
+  void handleSendPost(AsyncWebServerRequest* req);
+  void handleTxResult(AsyncWebServerRequest* req);
+#endif
 
   void createServer();
   void registerRoutes();

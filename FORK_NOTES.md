@@ -16,6 +16,7 @@ managed and updated without the ladder.
 | `OTA_CHECK_HTTPS` | `src/helpers/ESP32Board.cpp` | Upstream fetches the manifest over plain HTTP for `ota check` and the `ota update` pre-check. GitHub Pages redirects HTTP to HTTPS (301), so OTA never worked. With this flag the check uses the CA-verified TLS path. |
 | Env `Heltec_v3_repeater_observer_mqtt_webui` | `variants/heltec_v3/platformio.ini` | Stock V3 observer env + `WEBCONFIG_AUTOSTART_LAN`. Stock envs are unchanged. |
 | `.github/workflows/ota-pages.yml` | | Builds every `*_webui` env and publishes the OTA channel to GitHub Pages. |
+| `WEBCONFIG_RAW_TX` | `src/helpers/WebConfigRawTx.h`, `WebConfigServer.cpp`, `MyMesh.cpp` (`injectRawPacket`), `tools/webui_tx.py` | `POST /api/advert` + `POST /api/send` (+ `GET /api/tx/result?id=N`): transmit adverts / DMs for *other* identities. Keys and crypto stay on the PC (`tools/webui_tx.py`); the node checks shape, verifies advert signatures, and sends through its normal paths (floods use `default_scope` = `#dk`). LAN mode + panel login only, 1 packet per 3 s. Send-only: replies/ACKs to those identities are just forwarded. |
 
 ## OTA channel
 

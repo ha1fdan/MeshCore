@@ -1205,6 +1205,9 @@ void MyMesh::begin(FILESYSTEM *fs) {
   acl.load(_fs, self_id);
   // TODO: key_store.begin();
   region_map.load(_fs);
+#ifdef WEBCONFIG_RAW_TX
+  loadRawTxToken();
+#endif
 
   // establish default-scope
   {
@@ -1592,6 +1595,115 @@ void MyMesh::onConfigBatchEnd() {
   }
 }
 
+#ifdef WEBCONFIG_RAW_TX
+#include <esp_random.h>
+#define RAW_TX_TOKEN_FILE "/webui_tx_token"
+
+// Boot path: anything odd (missing, short, non-hex) just leaves token auth off.
+void MyMesh::loadRawTxToken() {
+  char buf[WebConfigRawTx::kTokenHexLen + 1] = {0};
+  if (_fs->exists(RAW_TX_TOKEN_FILE)) {
+    File f = _fs->open(RAW_TX_TOKEN_FILE, "r");
+    if (f) {
+      f.readBytes(buf, WebConfigRawTx::kTokenHexLen);
+      f.close();
+    }
+  }
+  WebConfigServer::setRawTxToken(WebConfigRawTx::isValidToken(buf) ? buf : NULL);
+  Serial.printf("WC: raw tx token %s\n", WebConfigServer::hasRawTxToken() ? "loaded" : "not set");
+}
+
+// `txtoken`       -> whether a token is set (never prints it)
+// `txtoken new`   -> create + save a new token, print it once (replaces the old one)
+// `txtoken off`   -> delete it; the TX endpoints then need a panel login again
+bool MyMesh::handleRawTxTokenCommand(const char* command, char* reply) {
+  if (strncmp(command, "txtoken", 7) != 0 || (command[7] != 0 && command[7] != ' ')) return false;
+  const char* arg = command + 7;
+  while (*arg == ' ') arg++;
+
+  if (*arg == 0) {
+    strcpy(reply, WebConfigServer::hasRawTxToken() ? "> set" : "> (not set)");
+  } else if (strcmp(arg, "new") == 0) {
+    uint8_t raw[WebConfigRawTx::kTokenHexLen / 2];
+    esp_fill_random(raw, sizeof(raw));   // hardware RNG (WiFi is up), not the mesh's StdRNG
+    char hex[WebConfigRawTx::kTokenHexLen + 1];
+    mesh::Utils::toHex(hex, raw, sizeof(raw));
+    memset(raw, 0, sizeof(raw));
+    File f = _fs->open(RAW_TX_TOKEN_FILE, "w");
+    if (!f) {
+      strcpy(reply, "Err - could not write token file");
+    } else {
+      size_t n = f.write((const uint8_t*)hex, WebConfigRawTx::kTokenHexLen);
+      f.close();
+      if (n != WebConfigRawTx::kTokenHexLen) {
+        _fs->remove(RAW_TX_TOKEN_FILE);
+        WebConfigServer::setRawTxToken(NULL);
+        strcpy(reply, "Err - token file write failed, token off");
+      } else {
+        WebConfigServer::setRawTxToken(hex);
+        sprintf(reply, "OK - token %s (shown once)", hex);
+      }
+    }
+    memset(hex, 0, sizeof(hex));
+  } else if (strcmp(arg, "off") == 0) {
+    if (_fs->exists(RAW_TX_TOKEN_FILE)) _fs->remove(RAW_TX_TOKEN_FILE);
+    WebConfigServer::setRawTxToken(NULL);
+    strcpy(reply, "OK - token off");
+  } else {
+    strcpy(reply, "Err - usage: txtoken [new|off]");
+  }
+  return true;
+}
+
+// /api/advert and /api/send: the bytes were signed/encrypted by the client
+// (tools/webui_tx.py). Adverts are signature-checked here, on the loop task,
+// because software Ed25519 verify wants ~3 KB of stack. Floods go out with the
+// same region scope and path-hash mode as this node's own adverts.
+bool MyMesh::injectRawPacket(const WebConfigRawTx::Request& tx, char* msg, size_t msg_size) {
+  using WebConfigRawTx::Kind;
+  const bool is_advert = (tx.kind == Kind::AdvertFlood || tx.kind == Kind::AdvertZeroHop);
+
+  if (is_advert) {
+    const size_t hdr = WebConfigRawTx::kAdvertHeaderLen;
+    const size_t app_len = tx.payload_len - hdr;   // >= 1, checked by the handler
+    uint8_t message[PUB_KEY_SIZE + 4 + MAX_ADVERT_DATA_SIZE];
+    memcpy(message, tx.payload, PUB_KEY_SIZE + 4);
+    memcpy(&message[PUB_KEY_SIZE + 4], &tx.payload[hdr], app_len);
+    mesh::Identity id(tx.payload);
+    if (!id.verify(&tx.payload[PUB_KEY_SIZE + 4], message, PUB_KEY_SIZE + 4 + app_len)) {
+      snprintf(msg, msg_size, "bad advert signature");
+      return false;
+    }
+  }
+
+  mesh::Packet* pkt = obtainNewPacket();
+  if (pkt == NULL) {
+    snprintf(msg, msg_size, "packet pool empty, retry");
+    return false;
+  }
+  pkt->header = ((is_advert ? PAYLOAD_TYPE_ADVERT : PAYLOAD_TYPE_TXT_MSG) << PH_TYPE_SHIFT);
+  memcpy(pkt->payload, tx.payload, tx.payload_len);
+  pkt->payload_len = tx.payload_len;
+
+  switch (tx.kind) {
+    case Kind::AdvertFlood:
+    case Kind::TxtFlood:
+      sendFloodScoped(default_scope, pkt, 0, _prefs.path_hash_mode + 1);
+      snprintf(msg, msg_size, "queued flood%s", default_scope.isNull() ? " (unscoped)" : " (scoped)");
+      break;
+    case Kind::AdvertZeroHop:
+      sendZeroHop(pkt);
+      snprintf(msg, msg_size, "queued zero-hop");
+      break;
+    case Kind::TxtDirect:
+      sendDirect(pkt, tx.path, tx.path_len);
+      snprintf(msg, msg_size, "queued direct, %d hop(s)", (int)(tx.path_len & 63));
+      break;
+  }
+  return true;
+}
+#endif
+
 // Stats snapshot for GET /api/stats. Runs on the loop task (from tick());
 // same sources as the REQ_TYPE_GET_STATUS reply and `get mqtt.stats`.
 void MyMesh::buildStatsJson(char* buf, size_t buf_size) {
@@ -1695,6 +1807,10 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     reply += 3;
     command += 3;
   }
+
+#ifdef WEBCONFIG_RAW_TX
+  if (handleRawTxTokenCommand(command, reply)) return;
+#endif
 
   // handle ACL related commands
   if (memcmp(command, "setperm ", 8) == 0) {   // format:  setperm {pubkey-hex} {permissions-int8}
